@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/rfc-index", "crates/rfc-cli", "crates/rfc-mcp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Jack Lloyd <jack@randombit.net>"]
+repository = "https://github.com/randombit/rfc-index"
+homepage = "https://github.com/randombit/rfc-index"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+rfc-index = { version = "0.1.0", path = "crates/rfc-index" }
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "gzip"] }
+roxmltree = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+regex = "1"
+rmcp = { version = "1.6", features = ["server", "macros", "transport-io"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+schemars = "0.8"
+
+[workspace.lints.clippy]
+collapsible_if = "allow"

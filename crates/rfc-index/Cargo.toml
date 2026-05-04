@@ -1,0 +1,29 @@
+[package]
+name = "rfc-index"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+description = "Local cache, full-text search, and reference graph for IETF RFCs."
+readme = "../../README.md"
+keywords = ["rfc", "ietf", "search", "sqlite"]
+categories = ["database", "parser-implementations"]
+
+[lib]
+name = "rfc_index"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+rusqlite = { workspace = true }
+reqwest = { workspace = true }
+roxmltree = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+directories = { workspace = true }
+regex = { workspace = true }
+
+[lints]
+workspace = true
