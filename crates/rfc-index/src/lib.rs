@@ -56,6 +56,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const DEFAULT_FETCH_INTERVAL_MS: u64 = 20;
+const DEFAULT_BASE_URL: &str = "https://www.rfc-editor.org";
 
 /// Handle to a local RFC index database.
 ///
@@ -64,6 +65,7 @@ pub struct RfcIndex {
     conn: Connection,
     path: PathBuf,
     client: Client,
+    base_url: String,
     last_fetch: Option<Instant>,
     min_interval: Duration,
 }
@@ -71,12 +73,19 @@ pub struct RfcIndex {
 impl RfcIndex {
     /// Open (and migrate) the database at `path`. Creates the file if missing.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_base_url(path, DEFAULT_BASE_URL)
+    }
+
+    /// Open (and migrate) the database at `path`, fetching metadata and bodies
+    /// from `base_url` instead of the default RFC Editor origin.
+    pub fn open_with_base_url(path: &Path, base_url: &str) -> Result<Self> {
         let conn = db::open(path)?;
         let client = build_client()?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),
             client,
+            base_url: normalize_base_url(base_url)?,
             last_fetch: None,
             min_interval: Duration::from_millis(DEFAULT_FETCH_INTERVAL_MS),
         })
@@ -108,7 +117,7 @@ impl RfcIndex {
     /// headers (If-None-Match / If-Modified-Since) when prior values are known;
     /// returns `not_modified=true` and skips ingest on 304.
     pub fn sync_index(&mut self) -> Result<SyncStats> {
-        index::sync(&mut self.conn, &self.client)
+        index::sync(&mut self.conn, &self.client, &self.base_url)
     }
 
     /// Epoch seconds of the most recent successful `sync_index`, or `None` if never synced.
@@ -159,7 +168,7 @@ impl RfcIndex {
             }
         };
         self.throttle();
-        let body = body::fetch(&self.client, number, has_xml)?;
+        let body = body::fetch(&self.client, number, has_xml, &self.base_url)?;
         query::save_body(&self.conn, &body)?;
         refs::index_body(&self.conn, number, body.text())?;
         search::reindex(&self.conn, number)?;
@@ -203,7 +212,7 @@ impl RfcIndex {
     /// Download `errata.json` and replace the local errata cache. Uses the
     /// same HEAD-probe + conditional GET workaround as `sync_index`.
     pub fn sync_errata(&mut self) -> Result<ErrataSyncStats> {
-        errata::sync(&mut self.conn, &self.client)
+        errata::sync(&mut self.conn, &self.client, &self.base_url)
     }
 
     /// All errata for one RFC (locally cached). Run `sync_errata` first.
@@ -239,6 +248,14 @@ fn build_client() -> Result<Client> {
         ))
         .gzip(true)
         .build()?)
+}
+
+fn normalize_base_url(base_url: &str) -> Result<String> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(Error::Malformed("base URL must not be empty".into()));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// "BCP14" / "bcp 14" / "std-3" / "BCP0014" → canonical "BCP0014" (similarly

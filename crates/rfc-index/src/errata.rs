@@ -7,9 +7,12 @@ use reqwest::blocking::Client;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 
-const ERRATA_URL: &str = "https://www.rfc-editor.org/errata.json";
-
-pub(crate) fn sync(conn: &mut Connection, client: &Client) -> Result<ErrataSyncStats> {
+pub(crate) fn sync(
+    conn: &mut Connection,
+    client: &Client,
+    base_url: &str,
+) -> Result<ErrataSyncStats> {
+    let errata_url = format!("{base_url}/errata.json");
     let prior_etag = read_meta(conn, "errata_etag")?;
     let prior_lm = read_meta(conn, "errata_last_modified")?;
 
@@ -17,7 +20,7 @@ pub(crate) fn sync(conn: &mut Connection, client: &Client) -> Result<ErrataSyncS
         if let Some(HeadProbe {
             etag,
             last_modified,
-        }) = head_probe(client, ERRATA_URL)?
+        }) = head_probe(client, &errata_url)?
         {
             if validators_match(&prior_etag, &etag, &prior_lm, &last_modified) {
                 write_meta(conn, "errata_synced_at", &now_epoch().to_string())?;
@@ -29,7 +32,7 @@ pub(crate) fn sync(conn: &mut Connection, client: &Client) -> Result<ErrataSyncS
         }
     }
 
-    let mut req = client.get(ERRATA_URL);
+    let mut req = client.get(&errata_url);
     if let Some(etag) = &prior_etag {
         req = req.header(reqwest::header::IF_NONE_MATCH, etag);
     }

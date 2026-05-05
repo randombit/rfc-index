@@ -7,9 +7,8 @@ use reqwest::blocking::Client;
 use roxmltree::{Document, Node};
 use rusqlite::{Connection, params};
 
-pub(crate) const INDEX_URL: &str = "https://www.rfc-editor.org/in-notes/rfc-index.xml";
-
-pub(crate) fn sync(conn: &mut Connection, client: &Client) -> Result<SyncStats> {
+pub(crate) fn sync(conn: &mut Connection, client: &Client, base_url: &str) -> Result<SyncStats> {
+    let index_url = format!("{base_url}/in-notes/rfc-index.xml");
     let prior_etag = read_meta(conn, "index_etag")?;
     let prior_last_modified = read_meta(conn, "index_last_modified")?;
 
@@ -19,7 +18,7 @@ pub(crate) fn sync(conn: &mut Connection, client: &Client) -> Result<SyncStats> 
         if let Some(HeadProbe {
             etag,
             last_modified,
-        }) = head_probe(client, INDEX_URL)?
+        }) = head_probe(client, &index_url)?
         {
             if validators_match(&prior_etag, &etag, &prior_last_modified, &last_modified) {
                 write_meta(conn, "index_synced_at", &now_epoch().to_string())?;
@@ -31,7 +30,7 @@ pub(crate) fn sync(conn: &mut Connection, client: &Client) -> Result<SyncStats> 
         }
     }
 
-    let mut req = client.get(INDEX_URL);
+    let mut req = client.get(&index_url);
     if let Some(etag) = &prior_etag {
         req = req.header(reqwest::header::IF_NONE_MATCH, etag);
     }

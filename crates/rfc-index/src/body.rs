@@ -3,13 +3,13 @@ use crate::model::{Body, SectionRef};
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
 
-pub(crate) fn fetch(client: &Client, number: u32, has_xml: bool) -> Result<Body> {
-    let text_url = format!("https://www.rfc-editor.org/rfc/rfc{number}.txt");
+pub(crate) fn fetch(client: &Client, number: u32, has_xml: bool, base_url: &str) -> Result<Body> {
+    let text_url = format!("{base_url}/rfc/rfc{number}.txt");
     let text = fetch_string(client, &text_url)?
         .ok_or_else(|| Error::NotFound(format!("RFC {number} text body (404)")))?;
 
     let xml = if has_xml {
-        let xml_url = format!("https://www.rfc-editor.org/rfc/rfc{number}.xml");
+        let xml_url = format!("{base_url}/rfc/rfc{number}.xml");
         fetch_string(client, &xml_url)?
     } else {
         None
