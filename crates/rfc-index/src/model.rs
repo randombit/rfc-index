@@ -226,18 +226,113 @@ impl SubSeriesRef {
 
 /// Filter set for [`RfcIndex::list`](crate::RfcIndex::list). Construct with
 /// field literals plus `..Default::default()`.
+///
+/// All filters compose with logical AND. Filters backed by SQL columns
+/// (year, status, wg, area, stream, xml, sub-series, obsolescence) are
+/// pushed down to the query; regex filters (title, author, abstract) are
+/// applied in Rust as a post-filter.
 #[derive(Debug, Default, Clone)]
 pub struct RfcQuery {
     /// Case-insensitive regex applied to title (post-filtered in Rust).
     pub title_regex: Option<String>,
     /// Inclusive lower bound on publication year.
     pub min_year: Option<i32>,
+    /// Inclusive upper bound on publication year.
+    pub max_year: Option<i32>,
     /// Case-insensitive substring match against `current_status`.
     pub status_contains: Option<String>,
     /// Restrict to RFCs whose XML source is available.
     pub xml_only: bool,
+    /// Case-insensitive exact match against the working-group acronym
+    /// (e.g. `"pkix"`, `"tls"`, `"quic"`).
+    pub wg: Option<String>,
+    /// Case-insensitive exact match against the IETF area code (e.g. `"sec"`).
+    pub area: Option<String>,
+    /// Case-insensitive exact match against the publication stream (e.g.
+    /// `"IETF"`, `"IRTF"`, `"Independent"`).
+    pub stream: Option<String>,
+    /// Restrict to RFCs that carry this editor-assigned keyword
+    /// (case-insensitive exact match against an entry in `rfc_keywords`).
+    pub keyword: Option<String>,
+    /// Case-insensitive regex applied to any author name (post-filtered).
+    pub author_regex: Option<String>,
+    /// Case-insensitive regex applied to the abstract text (post-filtered).
+    pub abstract_regex: Option<String>,
+    /// Restrict to RFCs that are members of any sub-series of this kind
+    /// (BCP / STD / FYI).
+    pub series: Option<SeriesKind>,
+    /// Exclude RFCs that have been obsoleted by another RFC.
+    pub not_obsoleted: bool,
     /// Maximum results to return. `None` (or `Some(0)`) means no limit.
     pub limit: Option<usize>,
+}
+
+/// One of the discoverable facets exposed by
+/// [`RfcIndex::facets`](crate::RfcIndex::facets). Each value of a facet
+/// partitions the index along one published metadata axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FacetKind {
+    /// IETF working-group acronym (e.g. `pkix`, `tls`).
+    WorkingGroup,
+    /// IETF area code (e.g. `sec`, `art`).
+    Area,
+    /// Publication stream (`IETF`, `IRTF`, `IAB`, `Independent`, `Editorial`,
+    /// `Legacy`).
+    Stream,
+    /// Editor-assigned keyword (`<kw>` in the index).
+    Keyword,
+    /// Current standardization status (e.g. `PROPOSED STANDARD`).
+    Status,
+}
+
+impl FacetKind {
+    /// Lower-case slug used by the CLI / MCP surface (`"wg"`, `"area"`,
+    /// `"stream"`, `"keyword"`, `"status"`).
+    pub fn as_slug(self) -> &'static str {
+        match self {
+            FacetKind::WorkingGroup => "wg",
+            FacetKind::Area => "area",
+            FacetKind::Stream => "stream",
+            FacetKind::Keyword => "keyword",
+            FacetKind::Status => "status",
+        }
+    }
+
+    /// Parse a facet slug. Accepts `wg` / `working-group`, `area`, `stream`,
+    /// `keyword` / `kw`, `status`. Returns `None` for unrecognised input.
+    pub fn parse(s: &str) -> Option<FacetKind> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "wg" | "working-group" | "working_group" | "workinggroup" => {
+                Some(FacetKind::WorkingGroup)
+            }
+            "area" => Some(FacetKind::Area),
+            "stream" => Some(FacetKind::Stream),
+            "keyword" | "kw" | "keywords" => Some(FacetKind::Keyword),
+            "status" => Some(FacetKind::Status),
+            _ => None,
+        }
+    }
+}
+
+/// One bucket from [`RfcIndex::facets`](crate::RfcIndex::facets): a distinct
+/// value of some facet plus the count of RFCs carrying it. RFCs without a
+/// value for the facet (e.g. no working group) are omitted; counts ignore the
+/// `null` bucket.
+#[derive(Debug, Clone)]
+pub struct Facet {
+    pub(crate) value: String,
+    pub(crate) count: u32,
+}
+
+impl Facet {
+    /// The facet value as published (e.g. `"pkix"`, `"sec"`, `"IETF"`).
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+    /// Number of RFCs that carry this facet value.
+    pub fn count(&self) -> u32 {
+        self.count
+    }
 }
 
 /// Aggregate counts of records currently in the local database.

@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rfc_index::{RfcIndex, RfcQuery};
+use rfc_index::{FacetKind, RfcIndex, RfcQuery, SeriesKind};
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -95,12 +95,42 @@ struct ListArgs {
     /// Inclusive lower bound on publication year.
     #[serde(default)]
     min_year: Option<i32>,
+    /// Inclusive upper bound on publication year.
+    #[serde(default)]
+    max_year: Option<i32>,
     /// Case-insensitive substring match against current_status.
     #[serde(default)]
     status_contains: Option<String>,
     /// Restrict to RFCs whose XML source is available.
     #[serde(default)]
     xml_only: bool,
+    /// IETF working-group acronym (e.g. "pkix"). Case-insensitive exact match.
+    #[serde(default)]
+    wg: Option<String>,
+    /// IETF area code (e.g. "sec"). Case-insensitive exact match.
+    #[serde(default)]
+    area: Option<String>,
+    /// Publication stream (e.g. "IETF", "IRTF", "Independent").
+    /// Case-insensitive exact match.
+    #[serde(default)]
+    stream: Option<String>,
+    /// Editor-assigned keyword (matches an entry in the published <kw> list).
+    /// Case-insensitive exact match.
+    #[serde(default)]
+    keyword: Option<String>,
+    /// Case-insensitive regex applied to any author name.
+    #[serde(default)]
+    author_regex: Option<String>,
+    /// Case-insensitive regex applied to the abstract text.
+    #[serde(default)]
+    abstract_regex: Option<String>,
+    /// Restrict to RFCs that are members of any sub-series of this kind:
+    /// "bcp", "std", or "fyi".
+    #[serde(default)]
+    series: Option<String>,
+    /// Exclude RFCs that have been obsoleted by another RFC.
+    #[serde(default)]
+    not_obsoleted: bool,
     /// Maximum results to return.
     #[serde(default = "default_list_limit")]
     limit: usize,
@@ -108,6 +138,35 @@ struct ListArgs {
 
 fn default_list_limit() -> usize {
     50
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FacetsArgs {
+    /// Which facet to enumerate. One of: "wg", "area", "stream", "keyword",
+    /// "status".
+    kind: String,
+    /// Case-insensitive substring filter on the facet value (e.g. "pkix" to
+    /// find a working group whose acronym contains "pkix").
+    #[serde(default)]
+    contains: Option<String>,
+    /// Maximum facet values to return.
+    #[serde(default = "default_facets_limit")]
+    limit: usize,
+}
+
+fn default_facets_limit() -> usize {
+    50
+}
+
+fn parse_series_kind(s: &str) -> Result<SeriesKind, String> {
+    match s.trim().to_ascii_uppercase().as_str() {
+        "BCP" => Ok(SeriesKind::Bcp),
+        "STD" => Ok(SeriesKind::Std),
+        "FYI" => Ok(SeriesKind::Fyi),
+        other => Err(format!(
+            "unknown series kind {other:?}; expected bcp/std/fyi"
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -225,18 +284,37 @@ impl Server {
     }
 
     #[tool(
-        description = "List RFCs matching filters, ordered by RFC number. Useful for \
-                       browsing or pre-seeding by topic/year."
+        description = "List RFCs matching filters, ordered by RFC number. Filters compose \
+                       with logical AND; regex filters are case-insensitive. Useful for \
+                       *discovery* — combine `wg`, `area`, `stream`, `keyword`, \
+                       `author_regex`, `abstract_regex`, `series`, year bounds, and the \
+                       `not_obsoleted` flag to find the set of RFCs relevant to a topic. \
+                       Pair with `list_facets` to learn what filter values exist."
     )]
     async fn list_rfcs(
         &self,
         Parameters(args): Parameters<ListArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let series = match args.series.as_deref() {
+            None => None,
+            Some(s) => {
+                Some(parse_series_kind(s).map_err(|msg| McpError::invalid_request(msg, None))?)
+            }
+        };
         let q = RfcQuery {
             title_regex: args.title_regex,
             min_year: args.min_year,
+            max_year: args.max_year,
             status_contains: args.status_contains,
             xml_only: args.xml_only,
+            wg: args.wg,
+            area: args.area,
+            stream: args.stream,
+            keyword: args.keyword,
+            author_regex: args.author_regex,
+            abstract_regex: args.abstract_regex,
+            series,
+            not_obsoleted: args.not_obsoleted,
             limit: Some(args.limit),
         };
         let rfcs = self.blocking(move |idx| idx.list(&q)).await?;
@@ -248,11 +326,54 @@ impl Server {
                     "title": r.title(),
                     "year": r.date().map(|d| d.year),
                     "status": r.current_status(),
+                    "wg": r.wg(),
+                    "area": r.area(),
+                    "stream": r.stream(),
                     "has_xml": r.has_xml(),
                 })
             })
             .collect();
         Ok(json_result(json!({ "rfcs": payload })))
+    }
+
+    #[tool(
+        description = "Enumerate distinct values of a discoverable facet, with the count \
+                       of RFCs carrying each value. Use this to discover what filter \
+                       values exist before drilling in via `list_rfcs`. \
+                       Recognised `kind`: \"wg\" (working group), \"area\" (IETF area), \
+                       \"stream\", \"keyword\", \"status\". Optional `contains` is a \
+                       case-insensitive substring filter on the facet value."
+    )]
+    async fn list_facets(
+        &self,
+        Parameters(args): Parameters<FacetsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let kind = FacetKind::parse(&args.kind).ok_or_else(|| {
+            McpError::invalid_request(
+                format!(
+                    "unknown facet {:?}; expected wg/area/stream/keyword/status",
+                    args.kind
+                ),
+                None,
+            )
+        })?;
+        let contains = args.contains.clone();
+        let limit = args.limit;
+        let facets = self
+            .blocking(move |idx| idx.facets(kind, contains.as_deref()))
+            .await?;
+        let total = facets.len();
+        let take = if limit == 0 { total } else { limit };
+        let arr: Vec<Value> = facets
+            .into_iter()
+            .take(take)
+            .map(|f| json!({ "value": f.value(), "count": f.count() }))
+            .collect();
+        Ok(json_result(json!({
+            "kind": kind.as_slug(),
+            "total": total,
+            "facets": arr,
+        })))
     }
 
     #[tool(
@@ -473,8 +594,12 @@ impl ServerHandler for Server {
              `get_rfc` for an RFC's metadata; `get_body` (with optional `section`) \
              for the rendered text; `references` to follow citation edges; \
              `get_sub_series` for BCP/STD/FYI lookups; `get_errata` for published \
-             errata. Bodies are fetched on demand and cached locally — prefer \
-             these tools over scraping URLs from rfc-editor.org."
+             errata. For *discovery* (\"what RFCs are relevant to topic X?\"), use \
+             `list_facets` to learn what working groups/areas/keywords exist, then \
+             `list_rfcs` with the corresponding filters (`wg`, `area`, `keyword`, \
+             `author_regex`, `abstract_regex`, `series`, `not_obsoleted`, ...). \
+             Bodies are fetched on demand and cached locally — prefer these tools \
+             over scraping URLs from rfc-editor.org."
                     .to_string(),
             )
     }

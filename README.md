@@ -50,10 +50,45 @@ rfc errata show 8446 --status verified   # filter by status substring
 rfc fetch --title-regex 'TLS|QUIC|PKCS' --since 2018 --xml-only
 ```
 
+## Discovery
+
+`search` is good once you know what term you're looking for. To answer
+"what RFCs are relevant to *topic X*" — say PKIX — combine `rfc facets`
+(introspect the index's metadata axes) with `rfc index list` (filter by
+those axes):
+
+```sh
+# What working groups have PKIX in the name?
+rfc facets wg --contains pkix
+# pkix         42
+
+# All RFCs the PKIX WG produced, excluding ones since obsoleted.
+rfc index list --wg pkix --not-obsoleted
+
+# Adjacent: anything tagged with the X.509 keyword.
+rfc index list --keyword X.509
+
+# RFCs from the security area, published since 2015, still current.
+rfc index list --area sec --since 2015 --not-obsoleted
+
+# Standards-track only, by a particular author.
+rfc index list --series std --author-regex 'Housley'
+
+# Anything mentioning "certificate revocation" in the abstract.
+rfc index list --abstract-regex 'certificate revocation'
+```
+
+Available facets: `wg`, `area`, `stream`, `keyword`, `status`. All
+`rfc index list` filters compose with logical AND. None of this requires
+any RFC bodies to be cached — it's all driven from `rfc-index.xml`. Once
+you've narrowed down the candidate set, `rfc search` (FTS5 over titles,
+abstracts, keywords, and bodies) and `rfc refs` (citation graph) refine
+further.
+
 ## MCP server
 
 `rfc-mcp` exposes the same surface as MCP tools over stdio, intended for
-coding agents (Claude Code, OpenCode, etc.).
+coding agents like Claude Code, OpenCode, etc.
 
 Build:
 
@@ -88,8 +123,13 @@ For OpenCode
   }
 ```
 
-Tools exposed: `get_rfc`, `search`, `list_rfcs`, `get_body`, `list_sections`,
-`references`, `get_sub_series`, `get_errata`, `sync_index`, `sync_errata`.
+Tools exposed: `get_rfc`, `search`, `list_rfcs`, `list_facets`, `get_body`,
+`list_sections`, `references`, `get_sub_series`, `get_errata`, `sync_index`,
+`sync_errata`. `list_rfcs` exposes the same facet filters as the CLI
+(`wg`, `area`, `stream`, `keyword`, `author_regex`, `abstract_regex`,
+`series`, `not_obsoleted`, year bounds, …) so an agent can do topical
+discovery without fetching bodies; `list_facets` enumerates the actual
+values present in the index.
 
 The server uses the same database as the CLI, so seeding/querying from either
 side is interchangeable. Sync the index/errata via the CLI once (or let the
@@ -99,7 +139,7 @@ fetched and cached as the agent reads them.
 ## Library
 
 ```rust
-use rfc_index::{RfcIndex, RfcQuery};
+use rfc_index::{FacetKind, RfcIndex, RfcQuery};
 
 let mut idx = RfcIndex::open_default()?;
 idx.sync_index()?;
@@ -114,6 +154,19 @@ println!("{}", s.text);
 let hits = idx.search("connection migration", Some(10))?;
 for h in hits {
     println!("RFC{} {}", h.number(), h.title());
+}
+
+// Discovery: which working groups mention "pkix", then list current PKIX RFCs.
+for f in idx.facets(FacetKind::WorkingGroup, Some("pkix"))? {
+    println!("WG {} — {} RFCs", f.value(), f.count());
+}
+let pkix = idx.list(&RfcQuery {
+    wg: Some("pkix".into()),
+    not_obsoleted: true,
+    ..Default::default()
+})?;
+for r in pkix {
+    println!("RFC{} {}", r.number(), r.title());
 }
 ```
 

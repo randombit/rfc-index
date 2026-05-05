@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::model::{
-    Author, Body, Counts, Date, Rfc, RfcQuery, SeriesKind, SubSeries, SubSeriesRef,
+    Author, Body, Counts, Date, Facet, FacetKind, Rfc, RfcQuery, SeriesKind, SubSeries,
+    SubSeriesRef,
 };
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -174,30 +175,62 @@ fn load_sub_series_for_rfc(conn: &Connection, n: u32) -> Result<Vec<SubSeriesRef
 }
 
 pub(crate) fn list_rfcs(conn: &Connection, q: &RfcQuery) -> Result<Vec<Rfc>> {
-    let title_re = match &q.title_regex {
-        Some(p) => Some(Regex::new(&format!("(?i){p}"))?),
-        None => None,
-    };
+    let title_re = compile_ci(q.title_regex.as_deref())?;
+    let author_re = compile_ci(q.author_regex.as_deref())?;
+    let abstract_re = compile_ci(q.abstract_regex.as_deref())?;
 
     let mut sql = String::from("SELECT number FROM rfcs WHERE 1=1");
-    if q.min_year.is_some() {
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if let Some(y) = q.min_year {
         sql.push_str(" AND date_year >= ?");
+        params.push(Box::new(y));
     }
-    if q.status_contains.is_some() {
+    if let Some(y) = q.max_year {
+        sql.push_str(" AND date_year <= ?");
+        params.push(Box::new(y));
+    }
+    if let Some(s) = &q.status_contains {
         sql.push_str(" AND lower(current_status) LIKE ?");
+        params.push(Box::new(format!("%{}%", s.to_lowercase())));
     }
     if q.xml_only {
         sql.push_str(" AND has_xml = 1");
     }
+    if let Some(w) = &q.wg {
+        sql.push_str(" AND lower(wg) = ?");
+        params.push(Box::new(w.to_lowercase()));
+    }
+    if let Some(a) = &q.area {
+        sql.push_str(" AND lower(area) = ?");
+        params.push(Box::new(a.to_lowercase()));
+    }
+    if let Some(s) = &q.stream {
+        sql.push_str(" AND lower(stream) = ?");
+        params.push(Box::new(s.to_lowercase()));
+    }
+    if let Some(k) = &q.keyword {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM rfc_keywords k \
+                            WHERE k.rfc = rfcs.number AND lower(k.keyword) = ?)",
+        );
+        params.push(Box::new(k.to_lowercase()));
+    }
+    if let Some(kind) = q.series {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM sub_series_members m \
+                            JOIN sub_series s ON s.doc_id = m.doc_id \
+                           WHERE m.rfc = rfcs.number AND s.series = ?)",
+        );
+        params.push(Box::new(kind.as_str().to_string()));
+    }
+    if q.not_obsoleted {
+        sql.push_str(
+            " AND NOT EXISTS (SELECT 1 FROM rfc_relations \
+                                WHERE from_rfc = rfcs.number AND kind = 'obsoleted_by')",
+        );
+    }
     sql.push_str(" ORDER BY number");
-
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    if let Some(y) = q.min_year {
-        params.push(Box::new(y));
-    }
-    if let Some(s) = &q.status_contains {
-        params.push(Box::new(format!("%{}%", s.to_lowercase())));
-    }
 
     let mut stmt = conn.prepare(&sql)?;
     let numbers: Vec<u32> = stmt
@@ -224,6 +257,17 @@ pub(crate) fn list_rfcs(conn: &Connection, q: &RfcQuery) -> Result<Vec<Rfc>> {
                 continue;
             }
         }
+        if let Some(re) = &author_re {
+            if !rfc.authors().iter().any(|a| re.is_match(a.name())) {
+                continue;
+            }
+        }
+        if let Some(re) = &abstract_re {
+            let abs = rfc.abstract_text().unwrap_or("");
+            if !re.is_match(abs) {
+                continue;
+            }
+        }
         out.push(rfc);
         if let Some(lim) = limit {
             if out.len() >= lim {
@@ -231,6 +275,61 @@ pub(crate) fn list_rfcs(conn: &Connection, q: &RfcQuery) -> Result<Vec<Rfc>> {
             }
         }
     }
+    Ok(out)
+}
+
+fn compile_ci(pattern: Option<&str>) -> Result<Option<Regex>> {
+    match pattern {
+        Some(p) => Ok(Some(Regex::new(&format!("(?i){p}"))?)),
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn facets(
+    conn: &Connection,
+    kind: FacetKind,
+    contains: Option<&str>,
+) -> Result<Vec<Facet>> {
+    let sql = match kind {
+        FacetKind::WorkingGroup => {
+            "SELECT wg AS value, COUNT(*) AS n FROM rfcs \
+             WHERE wg IS NOT NULL AND wg != '' GROUP BY wg"
+        }
+        FacetKind::Area => {
+            "SELECT area AS value, COUNT(*) AS n FROM rfcs \
+             WHERE area IS NOT NULL AND area != '' GROUP BY area"
+        }
+        FacetKind::Stream => {
+            "SELECT stream AS value, COUNT(*) AS n FROM rfcs \
+             WHERE stream IS NOT NULL AND stream != '' GROUP BY stream"
+        }
+        FacetKind::Status => {
+            "SELECT current_status AS value, COUNT(*) AS n FROM rfcs \
+             WHERE current_status IS NOT NULL AND current_status != '' \
+             GROUP BY current_status"
+        }
+        FacetKind::Keyword => {
+            "SELECT keyword AS value, COUNT(*) AS n FROM rfc_keywords GROUP BY keyword"
+        }
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Facet {
+            value: r.get::<_, String>(0)?,
+            count: r.get::<_, u32>(1)?,
+        })
+    })?;
+    let mut out: Vec<Facet> = rows.collect::<rusqlite::Result<_>>()?;
+
+    if let Some(needle) = contains {
+        let lower = needle.to_lowercase();
+        out.retain(|f| f.value.to_lowercase().contains(&lower));
+    }
+    out.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.value.to_lowercase().cmp(&b.value.to_lowercase()))
+    });
     Ok(out)
 }
 

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
-use clap::{Parser, Subcommand};
-use rfc_index::{Erratum, Rfc, RfcIndex, RfcQuery, SubSeries};
+use clap::{Args, Parser, Subcommand};
+use rfc_index::{Erratum, FacetKind, Rfc, RfcIndex, RfcQuery, SeriesKind, SubSeries};
 
 #[derive(Parser)]
 #[command(name = "rfc", about = "Local RFC index and cache")]
@@ -13,12 +13,111 @@ struct Cli {
     cmd: Cmd,
 }
 
+/// Filter set shared by `rfc index list` and `rfc fetch`. Maps directly to
+/// `RfcQuery`. All filters compose with logical AND; regex filters are
+/// case-insensitive.
+#[derive(Args, Default, Debug, Clone)]
+struct ListFilters {
+    /// Case-insensitive regex applied to the RFC title.
+    #[arg(long, value_name = "PATTERN")]
+    title_regex: Option<String>,
+    /// Inclusive lower bound on publication year.
+    #[arg(long, value_name = "YEAR")]
+    since: Option<i32>,
+    /// Inclusive upper bound on publication year.
+    #[arg(long, value_name = "YEAR")]
+    until: Option<i32>,
+    /// Case-insensitive substring match against `current_status`.
+    #[arg(long, value_name = "STATUS")]
+    status: Option<String>,
+    /// Restrict to RFCs whose XML source is available.
+    #[arg(long)]
+    xml_only: bool,
+    /// Working-group acronym (e.g. `pkix`, `tls`). Case-insensitive exact match.
+    #[arg(long, value_name = "WG")]
+    wg: Option<String>,
+    /// IETF area code (e.g. `sec`, `art`). Case-insensitive exact match.
+    #[arg(long, value_name = "AREA")]
+    area: Option<String>,
+    /// Publication stream (`IETF`, `IRTF`, `IAB`, `Independent`, `Editorial`,
+    /// `Legacy`). Case-insensitive exact match.
+    #[arg(long, value_name = "STREAM")]
+    stream: Option<String>,
+    /// Editor-assigned keyword. Case-insensitive exact match against an entry
+    /// in the `<kw>` list.
+    #[arg(long, value_name = "KEYWORD")]
+    keyword: Option<String>,
+    /// Case-insensitive regex applied to any author name.
+    #[arg(long, value_name = "PATTERN")]
+    author_regex: Option<String>,
+    /// Case-insensitive regex applied to the abstract text.
+    #[arg(long, value_name = "PATTERN")]
+    abstract_regex: Option<String>,
+    /// Restrict to RFCs that are members of any sub-series of this kind
+    /// (`bcp`, `std`, `fyi`).
+    #[arg(long, value_name = "KIND")]
+    series: Option<String>,
+    /// Exclude RFCs that have been obsoleted by another RFC.
+    #[arg(long)]
+    not_obsoleted: bool,
+}
+
+impl ListFilters {
+    fn into_query(self, limit: Option<usize>) -> Result<RfcQuery> {
+        let series = match self.series.as_deref() {
+            None => None,
+            Some(s) => Some(parse_series_kind(s)?),
+        };
+        Ok(RfcQuery {
+            title_regex: self.title_regex,
+            min_year: self.since,
+            max_year: self.until,
+            status_contains: self.status,
+            xml_only: self.xml_only,
+            wg: self.wg,
+            area: self.area,
+            stream: self.stream,
+            keyword: self.keyword,
+            author_regex: self.author_regex,
+            abstract_regex: self.abstract_regex,
+            series,
+            not_obsoleted: self.not_obsoleted,
+            limit,
+        })
+    }
+}
+
+fn parse_series_kind(s: &str) -> Result<SeriesKind> {
+    match s.trim().to_ascii_uppercase().as_str() {
+        "BCP" => Ok(SeriesKind::Bcp),
+        "STD" => Ok(SeriesKind::Std),
+        "FYI" => Ok(SeriesKind::Fyi),
+        other => Err(anyhow!(
+            "unknown series kind {other:?}; expected bcp/std/fyi"
+        )),
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Manage the RFC metadata index (rfc-index.xml)
     Index {
         #[command(subcommand)]
         sub: IndexCmd,
+    },
+    /// List distinct values of a discoverable facet (working group, area,
+    /// stream, keyword, status), with the count of RFCs carrying each value.
+    /// Use this to learn what filter values exist before drilling in via
+    /// `rfc index list`.
+    Facets {
+        /// Facet to enumerate: `wg`, `area`, `stream`, `keyword`, `status`.
+        kind: String,
+        /// Case-insensitive substring filter on the facet value.
+        #[arg(long, value_name = "PATTERN")]
+        contains: Option<String>,
+        /// Maximum facet values to print. Default: 50. Pass 0 for no limit.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
     /// Show metadata for an RFC or sub-series (BCP/STD/FYI)
     Info {
@@ -68,14 +167,8 @@ enum Cmd {
     },
     /// Bulk-fetch bodies for RFCs matching the given filters
     Fetch {
-        #[arg(long, value_name = "PATTERN")]
-        title_regex: Option<String>,
-        #[arg(long, value_name = "YEAR")]
-        since: Option<i32>,
-        #[arg(long, value_name = "STATUS")]
-        status: Option<String>,
-        #[arg(long)]
-        xml_only: bool,
+        #[command(flatten)]
+        filters: ListFilters,
         /// Maximum RFCs to process (default: all matches)
         #[arg(long)]
         limit: Option<usize>,
@@ -106,6 +199,7 @@ enum ErrataCmd {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum IndexCmd {
     /// Download rfc-index.xml and ingest metadata
     Sync,
@@ -113,14 +207,8 @@ enum IndexCmd {
     Status,
     /// List RFCs matching filters
     List {
-        #[arg(long, value_name = "PATTERN")]
-        title_regex: Option<String>,
-        #[arg(long, value_name = "YEAR")]
-        since: Option<i32>,
-        #[arg(long, value_name = "STATUS")]
-        status: Option<String>,
-        #[arg(long)]
-        xml_only: bool,
+        #[command(flatten)]
+        filters: ListFilters,
         /// Maximum results. Omit (or pass 0) for no limit.
         #[arg(long)]
         limit: Option<usize>,
@@ -139,14 +227,13 @@ fn main() -> Result<()> {
         Cmd::Index { sub } => match sub {
             IndexCmd::Sync => cmd_sync(&mut index),
             IndexCmd::Status => cmd_status(&index),
-            IndexCmd::List {
-                title_regex,
-                since,
-                status,
-                xml_only,
-                limit,
-            } => cmd_list(&index, title_regex, since, status, xml_only, limit),
+            IndexCmd::List { filters, limit } => cmd_list(&index, filters, limit),
         },
+        Cmd::Facets {
+            kind,
+            contains,
+            limit,
+        } => cmd_facets(&index, &kind, contains.as_deref(), limit),
         Cmd::Info { id } => cmd_info(&index, &id),
         Cmd::Get {
             number,
@@ -166,23 +253,11 @@ fn main() -> Result<()> {
         },
         Cmd::Refs { number, to } => cmd_refs(&index, number, to),
         Cmd::Fetch {
-            title_regex,
-            since,
-            status,
-            xml_only,
+            filters,
             limit,
             overwrite,
             stop_on_error,
-        } => cmd_fetch(
-            &mut index,
-            title_regex,
-            since,
-            status,
-            xml_only,
-            limit,
-            overwrite,
-            stop_on_error,
-        ),
+        } => cmd_fetch(&mut index, filters, limit, overwrite, stop_on_error),
     }
 }
 
@@ -241,21 +316,8 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m as u32, d as u32)
 }
 
-fn cmd_list(
-    index: &RfcIndex,
-    title_regex: Option<String>,
-    since: Option<i32>,
-    status: Option<String>,
-    xml_only: bool,
-    limit: Option<usize>,
-) -> Result<()> {
-    let q = RfcQuery {
-        title_regex,
-        min_year: since,
-        status_contains: status,
-        xml_only,
-        limit,
-    };
+fn cmd_list(index: &RfcIndex, filters: ListFilters, limit: Option<usize>) -> Result<()> {
+    let q = filters.into_query(limit)?;
     let rfcs = index.list(&q)?;
     if rfcs.is_empty() {
         eprintln!("(no matches)");
@@ -276,6 +338,31 @@ fn cmd_list(
             status_s,
             r.title()
         );
+    }
+    Ok(())
+}
+
+fn cmd_facets(index: &RfcIndex, kind: &str, contains: Option<&str>, limit: usize) -> Result<()> {
+    let parsed = FacetKind::parse(kind)
+        .ok_or_else(|| anyhow!("unknown facet {kind:?}; expected wg/area/stream/keyword/status"))?;
+    let facets = index.facets(parsed, contains)?;
+    if facets.is_empty() {
+        eprintln!("(no facet values)");
+        return Ok(());
+    }
+    let max_value_len = facets.iter().map(|f| f.value().len()).max().unwrap_or(0);
+    let take = if limit == 0 { facets.len() } else { limit };
+    let total = facets.len();
+    for f in facets.into_iter().take(take) {
+        println!(
+            "{:<width$}  {}",
+            f.value(),
+            f.count(),
+            width = max_value_len
+        );
+    }
+    if total > take {
+        eprintln!("({} more — pass --limit 0 to show all)", total - take);
     }
     Ok(())
 }
@@ -501,24 +588,14 @@ fn cmd_refs(index: &RfcIndex, n: u32, incoming: bool) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_fetch(
     index: &mut RfcIndex,
-    title_regex: Option<String>,
-    since: Option<i32>,
-    status: Option<String>,
-    xml_only: bool,
+    filters: ListFilters,
     limit: Option<usize>,
     overwrite: bool,
     stop_on_error: bool,
 ) -> Result<()> {
-    let q = RfcQuery {
-        title_regex,
-        min_year: since,
-        status_contains: status,
-        xml_only,
-        limit,
-    };
+    let q = filters.into_query(limit)?;
     let rfcs = index.list(&q)?;
     if rfcs.is_empty() {
         eprintln!("(no matches)");

@@ -1,4 +1,4 @@
-use rfc_index::{Result, RfcIndex, RfcQuery, SeriesKind};
+use rfc_index::{FacetKind, Result, RfcIndex, RfcQuery, SeriesKind};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -16,6 +16,24 @@ const ERRATA_LAST_MODIFIED: &str = "Tue, 02 Jan 2024 00:00:00 GMT";
 const RFC_INDEX_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <rfc-index>
   <rfc-entry>
+    <doc-id>RFC7000</doc-id>
+    <title>Legacy Widget TLS</title>
+    <author><name>O. Legacy</name></author>
+    <date><month>March</month><year>2014</year></date>
+    <current-status>HISTORIC</current-status>
+    <publication-status>PROPOSED STANDARD</publication-status>
+    <stream>IETF</stream>
+    <area>sec</area>
+    <wg_acronym>tls</wg_acronym>
+    <format>
+      <file-format>TEXT</file-format>
+    </format>
+    <abstract><p>Earlier TLS profile, now obsolete.</p></abstract>
+    <obsoleted-by>
+      <doc-id>RFC8446</doc-id>
+    </obsoleted-by>
+  </rfc-entry>
+  <rfc-entry>
     <doc-id>RFC8446</doc-id>
     <title>Widget TLS Profile</title>
     <author><name>T. Handshake</name></author>
@@ -23,10 +41,15 @@ const RFC_INDEX_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <current-status>PROPOSED STANDARD</current-status>
     <publication-status>PROPOSED STANDARD</publication-status>
     <stream>IETF</stream>
+    <area>sec</area>
+    <wg_acronym>tls</wg_acronym>
     <format>
       <file-format>TEXT</file-format>
     </format>
     <abstract><p>TLS profile for widgets.</p></abstract>
+    <obsoletes>
+      <doc-id>RFC7000</doc-id>
+    </obsoletes>
   </rfc-entry>
   <rfc-entry>
     <doc-id>RFC9000</doc-id>
@@ -163,7 +186,7 @@ fn sync_index_populates_queries_and_uses_head_probe_on_repeated_sync() -> Result
     let mut idx = open_test_index(db.path(), &server)?;
 
     let first = idx.sync_index()?;
-    assert_eq!(first.rfcs, 3);
+    assert_eq!(first.rfcs, 4);
     assert_eq!(first.bcps, 1);
     assert_eq!(first.stds, 1);
     assert_eq!(first.fyis, 0);
@@ -172,7 +195,7 @@ fn sync_index_populates_queries_and_uses_head_probe_on_repeated_sync() -> Result
     assert_eq!(server.request_count("HEAD", "/in-notes/rfc-index.xml"), 0);
 
     let counts = idx.counts()?;
-    assert_eq!(counts.rfcs, 3);
+    assert_eq!(counts.rfcs, 4);
     assert_eq!(counts.bcps, 1);
     assert_eq!(counts.stds, 1);
     assert_eq!(counts.fyis, 0);
@@ -225,6 +248,7 @@ fn sync_index_populates_queries_and_uses_head_probe_on_repeated_sync() -> Result
         status_contains: Some("proposed".into()),
         xml_only: true,
         limit: Some(10),
+        ..Default::default()
     })?;
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].number(), 9000);
@@ -342,6 +366,143 @@ fn sync_errata_populates_queries_and_uses_head_probe_on_repeated_sync() -> Resul
     assert_eq!(second.bytes, 0);
     assert_eq!(server.request_count("GET", "/errata.json"), 1);
     assert_eq!(server.request_count("HEAD", "/errata.json"), 1);
+
+    Ok(())
+}
+
+#[test]
+fn discovery_filters_compose() -> Result<()> {
+    let server = TestServer::spawn();
+    let db = TempDb::new("discovery-filters");
+    let mut idx = open_test_index(db.path(), &server)?;
+    idx.sync_index()?;
+
+    let by_wg = idx.list(&RfcQuery {
+        wg: Some("TLS".into()),
+        ..Default::default()
+    })?;
+    let nums: Vec<u32> = by_wg.iter().map(|r| r.number()).collect();
+    assert_eq!(nums, vec![7000, 8446]);
+
+    let by_area = idx.list(&RfcQuery {
+        area: Some("sec".into()),
+        ..Default::default()
+    })?;
+    assert_eq!(
+        by_area.iter().map(|r| r.number()).collect::<Vec<_>>(),
+        vec![7000, 8446]
+    );
+
+    let by_keyword = idx.list(&RfcQuery {
+        keyword: Some("realtime".into()),
+        ..Default::default()
+    })?;
+    assert_eq!(
+        by_keyword.iter().map(|r| r.number()).collect::<Vec<_>>(),
+        vec![9000]
+    );
+
+    let bcps = idx.list(&RfcQuery {
+        series: Some(SeriesKind::Bcp),
+        ..Default::default()
+    })?;
+    assert_eq!(
+        bcps.iter().map(|r| r.number()).collect::<Vec<_>>(),
+        vec![9000, 9001]
+    );
+
+    let stds = idx.list(&RfcQuery {
+        series: Some(SeriesKind::Std),
+        ..Default::default()
+    })?;
+    assert_eq!(
+        stds.iter().map(|r| r.number()).collect::<Vec<_>>(),
+        vec![8446]
+    );
+
+    let active = idx.list(&RfcQuery {
+        wg: Some("tls".into()),
+        not_obsoleted: true,
+        ..Default::default()
+    })?;
+    assert_eq!(
+        active.iter().map(|r| r.number()).collect::<Vec<_>>(),
+        vec![8446]
+    );
+
+    let bounded = idx.list(&RfcQuery {
+        min_year: Some(2018),
+        max_year: Some(2021),
+        ..Default::default()
+    })?;
+    assert_eq!(
+        bounded.iter().map(|r| r.number()).collect::<Vec<_>>(),
+        vec![8446, 9000]
+    );
+
+    let by_author = idx.list(&RfcQuery {
+        author_regex: Some("legacy".into()),
+        ..Default::default()
+    })?;
+    assert_eq!(
+        by_author.iter().map(|r| r.number()).collect::<Vec<_>>(),
+        vec![7000]
+    );
+
+    let by_abs = idx.list(&RfcQuery {
+        abstract_regex: Some(r"connection\s+migration".into()),
+        ..Default::default()
+    })?;
+    assert_eq!(
+        by_abs.iter().map(|r| r.number()).collect::<Vec<_>>(),
+        vec![9000]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn facets_enumerate_distinct_values_with_counts() -> Result<()> {
+    let server = TestServer::spawn();
+    let db = TempDb::new("facets");
+    let mut idx = open_test_index(db.path(), &server)?;
+    idx.sync_index()?;
+
+    let wgs = idx.facets(FacetKind::WorkingGroup, None)?;
+    let pairs: Vec<(String, u32)> = wgs
+        .iter()
+        .map(|f| (f.value().to_string(), f.count()))
+        .collect();
+    // Sorted by descending count, then lexicographic.
+    assert_eq!(pairs, vec![("tls".into(), 2u32), ("widgets".into(), 1u32)]);
+
+    let pkix_search = idx.facets(FacetKind::WorkingGroup, Some("TL"))?;
+    assert_eq!(pkix_search.len(), 1);
+    assert_eq!(pkix_search[0].value(), "tls");
+    assert_eq!(pkix_search[0].count(), 2);
+
+    let streams = idx.facets(FacetKind::Stream, None)?;
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0].value(), "IETF");
+    assert_eq!(streams[0].count(), 4);
+
+    let keywords = idx.facets(FacetKind::Keyword, None)?;
+    let kw_values: Vec<String> = keywords.iter().map(|f| f.value().to_string()).collect();
+    assert!(kw_values.contains(&"widgets".to_string()));
+    assert!(kw_values.contains(&"migration".to_string()));
+    assert!(kw_values.contains(&"realtime".to_string()));
+
+    let statuses = idx.facets(FacetKind::Status, None)?;
+    let by_value: std::collections::HashMap<String, u32> = statuses
+        .iter()
+        .map(|f| (f.value().to_string(), f.count()))
+        .collect();
+    assert_eq!(by_value.get("PROPOSED STANDARD").copied(), Some(2));
+    assert_eq!(by_value.get("HISTORIC").copied(), Some(1));
+    assert_eq!(by_value.get("INFORMATIONAL").copied(), Some(1));
+
+    let no_match = idx.facets(FacetKind::WorkingGroup, Some("nonsuch"))?;
+    assert!(no_match.is_empty());
 
     Ok(())
 }

@@ -46,8 +46,8 @@ mod search;
 
 pub use error::{Error, Result};
 pub use model::{
-    Author, Body, Counts, Date, ErrataSyncStats, Erratum, Rfc, RfcQuery, SearchHit, SectionRef,
-    SeriesKind, SubSeries, SubSeriesRef, SyncStats,
+    Author, Body, Counts, Date, ErrataSyncStats, Erratum, Facet, FacetKind, Rfc, RfcQuery,
+    SearchHit, SectionRef, SeriesKind, SubSeries, SubSeriesRef, SyncStats,
 };
 
 use reqwest::blocking::Client;
@@ -138,6 +138,21 @@ impl RfcIndex {
     /// List RFCs matching `query`, ordered by number.
     pub fn list(&self, query: &RfcQuery) -> Result<Vec<Rfc>> {
         query::list_rfcs(&self.conn, query)
+    }
+
+    /// Distinct values of a facet (working group, area, stream, keyword,
+    /// status) currently present in the index, paired with the number of RFCs
+    /// carrying each value.
+    ///
+    /// Use this to discover what filter values exist before drilling in via
+    /// [`list`](Self::list) — for example, listing the working groups whose
+    /// acronym contains `"pkix"` to find the canonical WG name.
+    ///
+    /// `contains`, when set, is a case-insensitive substring filter applied
+    /// to the facet value. Results are sorted by descending count, then by
+    /// value. RFCs missing the facet are omitted.
+    pub fn facets(&self, kind: FacetKind, contains: Option<&str>) -> Result<Vec<Facet>> {
+        query::facets(&self.conn, kind, contains)
     }
 
     /// Look up a sub-series record (BCP/STD/FYI). Accepts the canonical doc-id
