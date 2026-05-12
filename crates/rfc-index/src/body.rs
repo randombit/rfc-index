@@ -134,40 +134,68 @@ fn memchr_lf(bytes: &[u8], from: usize) -> Option<usize> {
 
 /// Parse one line. Returns `Some((num_range, title_range))` (relative byte offsets
 /// within `line`) iff it matches a numeric section header, else `None`.
+///
+/// Accepted shapes, to cover both modern xml2rfc and older RFC conventions:
+///   `N(.N)*[.]  Title` at column 0           — modern (e.g., RFC 9000)
+///   `N(.N)*[.] Title`  at column 0           — older single-space (e.g., RFC 1034)
+///   `   N.N+[.]  Title` indented up to 3 sp  — older indented sub-sections (e.g., RFC 1123)
 fn parse_header_line(line: &str) -> Option<((usize, usize), (usize, usize))> {
     let bytes = line.as_bytes();
-    if bytes.is_empty() || !bytes[0].is_ascii_digit() {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    // Optional leading whitespace (only meaningful for nested sub-sections; see below).
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    let leading = i;
+    // Cap indent to avoid sweeping in deeply-nested list items as headers.
+    if leading > 3 {
+        return None;
+    }
+
+    let num_start = i;
+    if i >= bytes.len() || !bytes[i].is_ascii_digit() {
         return None;
     }
 
     // Walk N(.N)* prefix.
-    let mut i = 0usize;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
         i += 1;
     }
+    let mut has_dot_separator = false;
     while i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1].is_ascii_digit() {
+        has_dot_separator = true;
         i += 1;
         while i < bytes.len() && bytes[i].is_ascii_digit() {
             i += 1;
         }
     }
     let num_end = i;
-    if num_end == 0 {
+    if num_end == num_start {
         return None;
     }
 
-    // Required terminating '.' after the number.
-    if i >= bytes.len() || bytes[i] != b'.' {
+    // Indented lines must be sub-section headers (have at least one '.N' separator);
+    // otherwise we'd pick up plain numbered list items like "   1. foo".
+    if leading > 0 && !has_dot_separator {
         return None;
     }
-    i += 1;
 
-    // Require two or more spaces (xml2rfc convention) before the title.
+    // Optional terminating '.' after the number — present in modern xml2rfc and
+    // most older styles, but RFC 1123 sub-section headers ("2.1  Title") omit it.
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+    }
+
+    // Require at least one space before the title.
     let space_start = i;
     while i < bytes.len() && bytes[i] == b' ' {
         i += 1;
     }
-    if i - space_start < 2 {
+    if i - space_start < 1 {
         return None;
     }
 
@@ -199,7 +227,7 @@ fn parse_header_line(line: &str) -> Option<((usize, usize), (usize, usize))> {
         }
     }
 
-    Some(((0, num_end), (title_start, title_end)))
+    Some(((num_start, num_end), (title_start, title_end)))
 }
 
 #[cfg(test)]
@@ -284,17 +312,123 @@ mod tests {
     }
 
     #[test]
-    fn requires_two_spaces_after_number() {
+    fn accepts_single_space_after_number_rfc1034_style() {
+        // RFC 1034 and other older RFCs use one space between "N.M." and the title.
         let text = "\
-1. NotAHeader
+3.5. Preferred name syntax
 
-1.  Header
+   text
+
+3.6. Resource Records
+
+   more text
+
+3.6.1. Textual expression of RRs
+
+   even more
+";
+        let got: Vec<_> = scan_sections(text)
+            .into_iter()
+            .map(|s| (s.number.to_string(), s.title.to_string()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("3.5".into(), "Preferred name syntax".into()),
+                ("3.6".into(), "Resource Records".into()),
+                ("3.6.1".into(), "Textual expression of RRs".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_indented_subsections_rfc1123_style() {
+        // RFC 1123 sub-sections are indented and omit the trailing '.' on the number.
+        let text = "\
+2.  GENERAL ISSUES
+
+   This section contains general requirements.
+
+   2.1  Host Names and Numbers
+
+      The syntax of a legal Internet host name...
+
+   2.2  Using Domain Name Service
+
+      Host domain names MUST be translated...
+";
+        let got: Vec<_> = scan_sections(text)
+            .into_iter()
+            .map(|s| (s.number.to_string(), s.title.to_string()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("2".into(), "GENERAL ISSUES".into()),
+                ("2.1".into(), "Host Names and Numbers".into()),
+                ("2.2".into(), "Using Domain Name Service".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn indented_top_level_numbers_are_not_headers() {
+        // A bare "N." with leading whitespace is a list item, not a section header.
+        let text = "\
+1.  Real Section
+
+   1. This is a list item
+
+2.  Other Section
 ";
         let nums: Vec<_> = scan_sections(text)
             .into_iter()
             .map(|s| s.number.to_string())
             .collect();
-        assert_eq!(nums, vec!["1".to_string()]);
+        assert_eq!(nums, vec!["1".to_string(), "2".to_string()]);
+    }
+
+    #[test]
+    fn find_section_works_for_legacy_styles() {
+        // RFC 1034 style.
+        let rfc1034 = "\
+3.4. Example name space
+
+   example content
+
+3.5. Preferred name syntax
+
+   syntax content
+
+3.6. Resource Records
+
+   rr content
+";
+        let s = find_section(rfc1034, "3.5").expect("3.5 should be findable");
+        assert_eq!(s.number, "3.5");
+        assert_eq!(s.title, "Preferred name syntax");
+        assert!(s.text.contains("syntax content"));
+        assert!(!s.text.contains("rr content"));
+
+        // RFC 1123 style.
+        let rfc1123 = "\
+2.  GENERAL ISSUES
+
+   This section contains general requirements.
+
+   2.1  Host Names and Numbers
+
+      host name content
+
+   2.2  Using Domain Name Service
+
+      dns content
+";
+        let s = find_section(rfc1123, "2.1").expect("2.1 should be findable");
+        assert_eq!(s.number, "2.1");
+        assert_eq!(s.title, "Host Names and Numbers");
+        assert!(s.text.contains("host name content"));
+        assert!(!s.text.contains("dns content"));
     }
 
     #[test]
